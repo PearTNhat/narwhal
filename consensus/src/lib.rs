@@ -4,8 +4,10 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
+use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
@@ -16,6 +18,7 @@ pub mod consensus_tests;
 type Dag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
 
 /// The state that needs to be persisted for crash-recovery.
+#[derive(Serialize, Deserialize, Default, Debug)]
 struct State {
     /// The last committed round.
     last_committed_round: Round,
@@ -67,6 +70,8 @@ pub struct Consensus {
     committee: Committee,
     /// The depth of the garbage collector.
     gc_depth: Round,
+    /// The persistent storage.
+    store: Store,
 
     /// Receives new certificates from the primary. The primary should send us new certificates only
     /// if it already sent us its whole history.
@@ -84,6 +89,7 @@ impl Consensus {
     pub fn spawn(
         committee: Committee,
         gc_depth: Round,
+        store: Store,
         rx_primary: Receiver<Certificate>,
         tx_primary: Sender<Certificate>,
         tx_output: Sender<Certificate>,
@@ -92,6 +98,7 @@ impl Consensus {
             Self {
                 committee: committee.clone(),
                 gc_depth,
+                store,
                 rx_primary,
                 tx_primary,
                 tx_output,
@@ -104,7 +111,22 @@ impl Consensus {
 
     async fn run(&mut self) {
         // The consensus state (everything else is immutable).
-        let mut state = State::new(self.genesis.clone());
+        const STATE_KEY: &[u8] = b"consensus_state";
+
+        // Try to load state from store. If it fails, create a new state.
+        let mut state: State = match self.store.read(STATE_KEY.to_vec()).await {
+            Ok(Some(bytes)) => bincode::deserialize(&bytes).unwrap_or_else(|e| {
+                warn!(
+                    "Could not deserialize consensus state from store: {}. Starting from genesis.",
+                    e
+                );
+                State::new(self.genesis.clone())
+            }),
+            _ => {
+                info!("No consensus state found in store. Starting from genesis.");
+                State::new(self.genesis.clone())
+            }
+        };
 
         // Listen to incoming certificates.
         while let Some(certificate) = self.rx_primary.recv().await {
@@ -133,14 +155,18 @@ impl Consensus {
             if leader_round <= state.last_committed_round {
                 continue;
             }
-            
+
             // -- BẮT ĐẦU LOGGING --
             info!("[CONSENSUS] Checking for leader at round {}", leader_round);
             let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
                 Some(x) => {
-                    info!("[CONSENSUS] Leader found for round {}: {:?}", leader_round, x.1.digest());
-                    x
-                },
+                    info!(
+                        "[CONSENSUS] Leader found for round {}: {:?}",
+                        leader_round,
+                        x.1.digest()
+                    );
+                    x.clone() // Clone to avoid borrowing issues
+                }
                 None => {
                     info!("[CONSENSUS] No leader found for round {}", leader_round);
                     continue;
@@ -158,27 +184,47 @@ impl Consensus {
                 .sum();
 
             let required_stake = self.committee.validity_threshold();
-            info!("[CONSENSUS] Leader {:?} has {} stake, requires {}", leader.digest(), stake, required_stake);
+            info!(
+                "[CONSENSUS] Leader {:?} has {} stake, requires {}",
+                leader.digest(),
+                stake,
+                required_stake
+            );
 
             // If it is the case, we can commit the leader.
             if stake < required_stake {
-                info!("[CONSENSUS] Leader {:?} does not have enough support, skipping commit", leader.digest());
+                info!(
+                    "[CONSENSUS] Leader {:?} does not have enough support, skipping commit",
+                    leader.digest()
+                );
                 continue;
             }
             // -- KẾT THÚC LOGGING --
 
             // Get an ordered list of past leaders that are linked to the current leader.
-            info!("[CONSENSUS] Leader {:?} has enough support! COMMITTING", leader.digest());
+            info!(
+                "[CONSENSUS] Leader {:?} has enough support! COMMITTING",
+                leader.digest()
+            );
             let mut sequence = Vec::new();
-            for leader in self.order_leaders(leader, &state).iter().rev() {
+            let mut committed_something = false;
+            for leader_cert in self.order_leaders(&leader, &state).iter().rev() {
                 // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
-                for x in self.order_dag(leader, &state) {
+                for x in self.order_dag(leader_cert, &state) {
                     // Update and clean up internal state.
                     state.update(&x, self.gc_depth);
 
                     // Add the certificate to the sequence.
                     sequence.push(x);
+                    committed_something = true;
                 }
+            }
+
+            // If we committed anything, persist the new state.
+            if committed_something {
+                let serialized_state =
+                    bincode::serialize(&state).expect("Failed to serialize state");
+                self.store.write(STATE_KEY.to_vec(), serialized_state).await;
             }
 
             // Log the latest committed round of every authority (for debug).
@@ -258,9 +304,26 @@ impl Consensus {
     fn linked(&self, leader: &Certificate, prev_leader: &Certificate, dag: &Dag) -> bool {
         let mut parents = vec![leader];
         for r in (prev_leader.round()..leader.round()).rev() {
-            parents = dag
-                .get(&(r))
-                .expect("We should have the whole history by now")
+            // Lấy các certificate của round 'r'.
+            // Thay thế .expect() bằng một khối match để xử lý an toàn trường hợp round bị thiếu.
+            let round_certificates = match dag.get(&r) {
+                Some(certs) => certs,
+                None => {
+                    // Nếu một round trung gian hoàn toàn thiếu trong DAG (thường xảy ra khi node đang đồng bộ hóa),
+                    // chúng ta không thể xác định được đường dẫn.
+                    // Ghi lại cảnh báo và trả về 'false' thay vì làm sập chương trình.
+                    warn!(
+                    "[CONSENSUS] Missing entire round {} in DAG during path check between leaders at round {} and {}.",
+                    r,
+                    leader.round(),
+                    prev_leader.round()
+                );
+                    return false;
+                }
+            };
+
+            // Tiếp tục logic tìm kiếm parent như cũ.
+            parents = round_certificates
                 .values()
                 .filter(|(digest, _)| parents.iter().any(|x| x.header.parents.contains(digest)))
                 .map(|(_, certificate)| certificate)
@@ -297,7 +360,7 @@ impl Consensus {
                 skip |= state
                     .last_committed
                     .get(&certificate.origin())
-                    .map_or_else(|| false, |r| r == &certificate.round());
+                    .map_or_else(|| false, |r| r >= &certificate.round());
                 if !skip {
                     buffer.push(certificate);
                     already_ordered.insert(digest);
