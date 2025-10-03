@@ -85,6 +85,7 @@ impl SimpleSender {
     }
 }
 
+//đường ống TCP một chiều: nhận message từ channel và bắn sang peer.
 /// A connection is responsible to establish and keep alive (if possible) a connection with a single peer.
 struct Connection {
     /// The destination address.

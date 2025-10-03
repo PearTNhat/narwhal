@@ -214,7 +214,7 @@ impl Worker {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
-          // 1. Mở 'cổng giao tiếp' để nhận tin nhắn từ các worker ngang hàng.
+        // 1. Mở 'cổng giao tiếp' để nhận tin nhắn từ các worker ngang hàng.
         // Receive incoming messages from other workers.
         let mut address = self
             .committee
@@ -232,7 +232,7 @@ impl Worker {
                 tx_processor, // Nếu là batch hoàn chỉnh -> Processor.
             },
         );
-                // 2. Khởi chạy 'bộ phận hỗ trợ'.
+        // 2. Khởi chạy 'bộ phận hỗ trợ'.
         // Chuyên trả lời các yêu cầu xin batch từ các worker khác.
         // The `Helper` is dedicated to reply to batch requests from other workers.
         Helper::spawn(

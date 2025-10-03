@@ -6,16 +6,25 @@ use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use consensus::Consensus;
 use env_logger::Env;
+use libp2p::Multiaddr;
+use log::info;
 use primary::{Certificate, Primary};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 use worker::{Worker, WorkerMessage};
-
 // Thêm các use statements cần thiết
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use prost::Message;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+
+// Import P2P modules
+use libp2p::{gossipsub, PeerId};
+use p2p::{
+    event_loop,
+    functions::{create_derived_keypair},
+    types::{get_primary_topic, get_worker_topic, P2pMessage, PrimaryMessage1, WorkerMessage1},
+};
 
 // Thêm module để import các struct được tạo bởi prost
 pub mod comm {
@@ -86,7 +95,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     // 2. Tải cấu hình từ các file JSON
     // Read the committee and node's keypair from file.
     let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
-    
+
     let committee =
         Committee::import(committee_file).context("Failed to load the committee information")?;
 
@@ -97,15 +106,128 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         }
         None => Parameters::default(),
     };
-    // 3. Tạo kho lưu trữ (database)
     // Make the data store.
     let store = Store::new(store_path).context("Failed to create a store")?;
 
-    // 4. Tạo kênh giao tiếp cho kết quả đồng thuận
     // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
-    // 5. Chạy Primary hoặc Worker
+  
+    // 2. XÁC ĐỊNH VAI TRÒ VÀ TẠO P2P KEYPAIR DUY NHẤT
+    // Logic này được chuyển lên trước để quyết định component_id
+    let (p2p_keypair, role) = match matches.subcommand() {
+        ("primary", _) => {
+            info!("Running as a PRIMARY");
+            // Sử dụng một ID đặc biệt cho Primary để đảm bảo nó khác với mọi Worker
+            let key = create_derived_keypair(&keypair.name, u32::MAX);
+            (key, "Primary")
+        }
+        ("worker", Some(sub_matches)) => {
+            let id = sub_matches.value_of("id").unwrap().parse::<WorkerId>()?;
+            info!("Running as a WORKER with id {}", id);
+            // Sử dụng chính WorkerId để tạo keypair duy nhất
+            let key = create_derived_keypair(&keypair.name, id);
+            (key, "Worker")
+        }
+        _ => unreachable!(),
+    }; 
+
+    let local_peer_id = p2p_keypair.public().to_peer_id();
+    info!("📌 P2P Peer ID for {}: {}", role, local_peer_id);
+
+    // Tạo Swarm
+    let mut swarm = p2p::create_p2p_swarm(p2p_keypair, local_peer_id)
+        .await
+        .expect("Failed to create P2P swarm");
+
+
+    // Lắng nghe trên một port duy nhất (logic tìm port trống của bạn rất tốt)
+    let mut p2p_port = 9000; // Port khởi đầu
+    for _ in 0..10 {
+        let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", p2p_port).parse()?;
+        match swarm.listen_on(listen_addr) {
+            Ok(_) => {
+                info!("✅ P2P listening on port {}", p2p_port);
+                break;
+            }
+            Err(e) => {
+                info!("⚠️ Port {} in use, trying next. Error: {}", p2p_port, e);
+                p2p_port += 1;
+            }
+        }
+    }
+    // Đăng ký (subscribe) vào các topic phù hợp với vai trò của node
+    let primary_topic = get_primary_topic();
+    let worker_topic = get_worker_topic();
+    if matches.subcommand_matches("primary").is_some() {
+        swarm.behaviour_mut().gossipsub.subscribe(&primary_topic)?;
+        info!("P ___Subscribed to PRIMARY topic: {}", primary_topic);
+    }
+    if matches.subcommand_matches("worker").is_some() {
+        swarm.behaviour_mut().gossipsub.subscribe(&worker_topic)?;
+        info!("W ___Subscribed to WORKER topic: {}", worker_topic);
+    }
+    // --- 3. TẠO CÁC KÊNH GIAO TIẾP CÓ CẤU TRÚC ---
+    // Kênh để logic chính gửi message ra P2P event loop
+    let (tx_to_p2p, rx_from_core) = channel(CHANNEL_CAPACITY);
+    // Kênh để P2P event loop gửi message đã xử lý vào logic Primary
+    let (tx_to_primary, mut rx_for_primary) = channel(CHANNEL_CAPACITY);
+    // Kênh để P2P event loop gửi message đã xử lý vào logic Worker
+    let (tx_to_worker, mut rx_for_worker) = channel(CHANNEL_CAPACITY);
+    // Chạy P2P event loop trong một task riêng
+   // Chạy P2P event loop trong một task riêng
+    tokio::spawn(async move {
+        event_loop::run_p2p_event_loop(swarm, rx_from_core, tx_to_primary, tx_to_worker).await;
+    });
+
+    // --- KẾT THÚC KHỞI TẠO P2P ---
+    // --- 4. DEMO GỬI VÀ NHẬN MESSAGE CÓ CẤU TRÚC ---
+    let tx_p2p_clone = tx_to_p2p.clone();
+    let key_name_clone = keypair.name.clone();
+    tokio::spawn(async move {
+        use tokio::time::{sleep, Duration};
+        sleep(Duration::from_secs(5)).await; // Đợi mạng ổn định
+        
+        loop {
+            let hello_msg = format!("Hello from Primary {}", key_name_clone);
+            let p2p_message = P2pMessage::Primary(PrimaryMessage1::Hello(hello_msg));
+            
+            // Gửi message lên topic của Primary
+            if tx_p2p_clone.send((get_primary_topic(), p2p_message)).await.is_err() {
+                log::warn!("Core logic channel closed, stopping demo sender.");
+                break;
+            }
+            sleep(Duration::from_secs(10)).await;
+        }
+    });
+
+    // Task lắng nghe message cho Primary
+    tokio::spawn(async move {
+        info!("👂 PRIMARY message listener task started.");
+        while let Some(message) = rx_for_primary.recv().await {
+            match message {
+                PrimaryMessage1::Hello(msg) => {
+                    info!("🎉 [PRIMARY LOGIC] Received Hello: '{}'", msg);
+                }
+                // Thêm các case xử lý cho các loại message khác của Primary
+                // PrimaryMessage::Header(header_bytes) => { ... }
+            }
+        }
+    });
+
+    // Task lắng nghe message cho Worker
+    tokio::spawn(async move {
+        info!("👂 WORKER message listener task started.");
+        while let Some(message) = rx_for_worker.recv().await {
+             match message {
+                WorkerMessage1::Hello(msg) => {
+                     info!("🎉 [WORKER LOGIC] Received Hello: '{}'", msg);
+                }
+                // Thêm các case xử lý cho các loại message khác của Worker
+             }
+        }
+    });
+
     // Check whether to run a primary, a worker, or an entire authority.
     match matches.subcommand() {
         // Spawn the primary and consensus core.
@@ -123,11 +245,11 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .position(|pk| pk == &keypair.name)
                 .unwrap();
             log::info!("Node {} khởi chạy với ID: {}", keypair.name, node_id);
-            //Đề xuât cho Người điều phối (Consensus) 
+            //Đề xuât cho Người điều phối (Consensus)
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
-            // kênh nhận phản hồi từ Người điều phối (Consensus)    
+            // kênh nhận phản hồi từ Người điều phối (Consensus)
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
-              // Bắt đầu công việc của Bếp trưởng
+            // Bắt đầu công việc của Bếp trưởng
             Primary::spawn(
                 keypair,
                 committee.clone(),
@@ -136,7 +258,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 /* tx_consensus */ tx_new_certificates,
                 /* rx_consensus */ rx_feedback,
             );
-             // Bắt đầu công việc của Người điều phối
+            // Bắt đầu công việc của Người điều phối
             Consensus::spawn(
                 committee,
                 parameters.gc_depth,
@@ -145,7 +267,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 tx_output,
             );
 
-           // Giao kết quả cuối cùng cho người phục vụ
+            // Giao kết quả cuối cùng cho người phục vụ
             analyze(rx_output, node_id, store).await;
         }
         //Chỉ đơn giản là khởi chạy một Worker. Worker chịu trách nhiệm nhận giao dịch từ client và tạo các batch (lô) giao dịch.
@@ -192,7 +314,7 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         socket_path
     );
     //// Vòng lặp kết nối lại nếu thất bại
-    let mut stream = loop { 
+    let mut stream = loop {
         match UnixStream::connect(&socket_path).await {
             Ok(stream) => {
                 log::info!(

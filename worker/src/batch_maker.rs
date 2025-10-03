@@ -69,6 +69,7 @@ impl BatchMaker {
 
     /// Main loop receiving incoming transactions and creating batches.
     async fn run(&mut self) {
+        //Timer này đảm bảo rằng nếu batch chưa đủ to thì vẫn phải gửi đi sau một thời gian.
         let timer = sleep(Duration::from_millis(self.max_batch_delay));
         tokio::pin!(timer);
 

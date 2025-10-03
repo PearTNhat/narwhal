@@ -246,7 +246,7 @@ impl Committee {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct KeyPair {
     /// The node's public key (and identifier).
     pub name: PublicKey,

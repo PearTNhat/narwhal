@@ -118,6 +118,7 @@ impl AsRef<[u8]> for PublicKey {
 }
 
 /// Represents a secret key (in bytes).
+#[derive(Clone)]
 pub struct SecretKey([u8; 64]);
 
 impl SecretKey {
@@ -159,6 +160,7 @@ impl Drop for SecretKey {
         self.0.iter_mut().for_each(|x| *x = 0);
     }
 }
+
 
 pub fn generate_production_keypair() -> (PublicKey, SecretKey) {
     generate_keypair(&mut OsRng)
