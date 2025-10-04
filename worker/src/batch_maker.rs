@@ -1,7 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
-use bytes::Bytes;
 #[cfg(feature = "benchmark")]
 use crypto::Digest;
 use crypto::PublicKey;
@@ -15,6 +14,8 @@ use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
+use libp2p::PeerId;
+use p2p::ReqResCommand;
 
 #[cfg(test)]
 #[path = "tests/batch_maker_tests.rs"]
@@ -35,12 +36,16 @@ pub struct BatchMaker {
     tx_message: Sender<QuorumWaiterMessage>,
     /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
+    /// Mapping from PublicKey to PeerId for P2P communication.
+    peer_mapping: std::collections::HashMap<PublicKey, PeerId>,
+    /// Channel to send P2P request-response commands.
+    tx_req_res: Sender<ReqResCommand>,
+    /// Request ID counter.
+    request_counter: u64,
     /// Holds the current batch.
     current_batch: Batch,
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
-    /// A network sender to broadcast the batches to the other workers.
-    network: ReliableSender,
 }
 
 impl BatchMaker {
@@ -50,6 +55,8 @@ impl BatchMaker {
         rx_transaction: Receiver<Transaction>,
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
+        peer_mapping: std::collections::HashMap<PublicKey, PeerId>,
+        tx_req_res: Sender<ReqResCommand>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -58,9 +65,11 @@ impl BatchMaker {
                 rx_transaction,
                 tx_message,
                 workers_addresses,
+                peer_mapping,
+                tx_req_res,
+                request_counter: 0,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
-                network: ReliableSender::new(),
             }
             .run()
             .await;
@@ -141,16 +150,36 @@ impl BatchMaker {
             info!("Batch {:?} contains {} B", digest, size);
         }
 
-        // Broadcast the batch through the network.
-        let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
-        let bytes = Bytes::from(serialized.clone());
-        let handlers = self.network.broadcast(addresses, bytes).await;
+        // Broadcast the batch through P2P network.
+        let names: Vec<_> = self.workers_addresses.iter().map(|(name, _)| *name).collect();
+        let mut request_ids = Vec::new();
+        
+        for name in &names {
+            if let Some(peer_id) = self.peer_mapping.get(name) {
+                self.request_counter += 1;
+                let request_id = self.request_counter;
+                request_ids.push(request_id);
+                
+                let cmd = ReqResCommand::SendRequest {
+                    request_id,
+                    target_peer: *peer_id,
+                    data: serialized.clone(),
+                };
+                
+                if let Err(e) = self.tx_req_res.send(cmd).await {
+                    log::warn!("Failed to send batch request to {}: {}", peer_id, e);
+                }
+            } else {
+                log::warn!("No PeerId mapping found for worker: {:?}", name);
+            }
+        }
 
         // Send the batch through the deliver channel for further processing.
         self.tx_message
             .send(QuorumWaiterMessage {
                 batch: serialized,
-                handlers: names.into_iter().zip(handlers.into_iter()).collect(),
+                request_ids,
+                worker_names: names,
             })
             .await
             .expect("Failed to deliver batch");

@@ -2,10 +2,9 @@
 use crate::processor::SerializedBatchMessage;
 use config::{Committee, Stake};
 use crypto::PublicKey;
-use futures::stream::futures_unordered::FuturesUnordered;
-use futures::stream::StreamExt as _;
-use network::CancelHandler;
 use tokio::sync::mpsc::{Receiver, Sender};
+use p2p::ReqResEvent;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 #[path = "tests/quorum_waiter_tests.rs"]
@@ -15,8 +14,10 @@ pub mod quorum_waiter_tests;
 pub struct QuorumWaiterMessage {
     /// A serialized `WorkerMessage::Batch` message.
     pub batch: SerializedBatchMessage,
-    /// The cancel handlers to receive the acknowledgements of our broadcast.
-    pub handlers: Vec<(PublicKey, CancelHandler)>,
+    /// Request IDs that were sent to workers.
+    pub request_ids: Vec<u64>,
+    /// Names of workers we sent to.
+    pub worker_names: Vec<PublicKey>,
 }
 
 /// The QuorumWaiter waits for 2f authorities to acknowledge reception of a batch.
@@ -29,6 +30,8 @@ pub struct QuorumWaiter {
     rx_message: Receiver<QuorumWaiterMessage>,
     /// Channel to deliver batches for which we have enough acknowledgements.
     tx_batch: Sender<SerializedBatchMessage>,
+    /// Channel to receive P2P ACK events.
+    rx_req_res_event: Receiver<ReqResEvent>,
 }
 
 impl QuorumWaiter {
@@ -38,6 +41,7 @@ impl QuorumWaiter {
         stake: Stake,
         rx_message: Receiver<QuorumWaiterMessage>,
         tx_batch: Sender<Vec<u8>>,
+        rx_req_res_event: Receiver<ReqResEvent>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -45,46 +49,95 @@ impl QuorumWaiter {
                 stake,
                 rx_message,
                 tx_batch,
+                rx_req_res_event,
             }
             .run()
             .await;
         });
     }
 
-    /// Helper function. It waits for a future to complete and then delivers a value.
-    async fn waiter(wait_for: CancelHandler, deliver: Stake) -> Stake {
-        let _ = wait_for.await;
-        deliver
-    }
+    // NOTE: Helper function không còn cần thiết với P2P implementation
 
     /// Main loop.
     async fn run(&mut self) {
-        while let Some(QuorumWaiterMessage { batch, handlers }) = self.rx_message.recv().await {
-            // 1. Tạo một tập hợp các "công việc" chờ đợi song song.
-            let mut wait_for_quorum: FuturesUnordered<_> = handlers
-                .into_iter()
-                // 2. Với mỗi handler (đại diện cho một worker), tạo một "công việc" con.
-                .map(|(name, handler)| {
-                    // 3. Lấy ra "trọng số" (stake) của worker đó.
-                    let stake = self.committee.stake(&name);
-                    // 4. Tạo một future 'waiter' sẽ chờ handler hoàn thành rồi trả về stake.
-                    Self::waiter(handler, stake)
-                })
-                .collect();
-
-            // 5. Bắt đầu vòng lặp chờ đợi.
-            let mut total_stake = self.stake; // Bắt đầu bằng stake của chính mình.
-            while let Some(stake) = wait_for_quorum.next().await {
-                // 6. `next().await` sẽ đợi cho đến khi BẤT KỲ worker nào gửi Ack về.
-                //    Khi có Ack, nó trả về `stake` của worker đó.
-                total_stake += stake; // 7. Cộng dồn "vote" vào tổng.
-                if total_stake >= self.committee.quorum_threshold() {
-                    // 8. Nếu tổng vote đạt ngưỡng, gửi batch đi xử lý tiếp.
-                    self.tx_batch
-                        .send(batch)
-                        .await
-                        .expect("Failed to deliver batch");
-                    // 9. Thoát khỏi vòng lặp, không cần chờ thêm Ack nữa.
+        // Track pending batches: request_id -> (batch, expected_request_ids, worker_names, received_acks)
+        let mut pending_batches: HashMap<u64, (SerializedBatchMessage, HashSet<u64>, Vec<PublicKey>, HashSet<u64>)> = HashMap::new();
+        loop {
+            tokio::select! {
+                // Nhận batch mới từ BatchMaker
+                Some(QuorumWaiterMessage { batch, request_ids, worker_names }) = self.rx_message.recv() => {
+                    if request_ids.is_empty() {
+                        // Không có worker nào để gửi, xử lý ngay
+                        self.tx_batch
+                            .send(batch)
+                            .await
+                            .expect("Failed to deliver batch");
+                    } else {
+                        // Lưu batch và chờ ACK
+                        let batch_id = request_ids[0]; // Dùng request_id đầu tiên làm batch_id
+                        let expected_ids: HashSet<u64> = request_ids.iter().cloned().collect();
+                        pending_batches.insert(batch_id, (batch, expected_ids, worker_names, HashSet::new()));
+                        log::info!("[QuorumWaiter] Waiting for ACKs for batch {}, expecting {} responses", batch_id, request_ids.len());
+                    }
+                }
+                
+                // Nhận ACK từ P2P
+                Some(event) = self.rx_req_res_event.recv() => {
+                    match event {
+                        ReqResEvent::ResponseReceived { request_id, from_peer, success, message } => {
+                            log::info!("[QuorumWaiter] Received ACK for request {} from {}: success={}, msg={}", 
+                                request_id, from_peer, success, message);
+                            
+                            // Tìm batch_id tương ứng
+                            let mut batch_to_forward = None;
+                            let mut batch_id_to_remove = None;
+                            
+                            for (batch_id, (batch, expected_ids, worker_names, received_acks)) in pending_batches.iter_mut() {
+                                if expected_ids.contains(&request_id) {
+                                    received_acks.insert(request_id);
+                                    
+                                    // Tính tổng stake từ các worker đã ACK
+                                    let mut total_stake = self.stake; // Bắt đầu với stake của chính mình
+                                    for (i, req_id) in expected_ids.iter().enumerate() {
+                                        if received_acks.contains(req_id) && i < worker_names.len() {
+                                            total_stake += self.committee.stake(&worker_names[i]);
+                                        }
+                                    }
+                                    
+                                    log::info!("[QuorumWaiter] Batch {} - Total stake: {} / Quorum: {}", 
+                                        batch_id, total_stake, self.committee.quorum_threshold());
+                                    
+                                    // Kiểm tra quorum
+                                    if total_stake >= self.committee.quorum_threshold() {
+                                        log::info!("[QuorumWaiter] ✅ Batch {} reached quorum! Forwarding to Processor", batch_id);
+                                        batch_to_forward = Some(batch.clone());
+                                        batch_id_to_remove = Some(*batch_id);
+                                    }
+                                    break;
+                                }
+                            }
+                            
+                            // Forward batch và xóa khỏi pending (sau khi thoát khỏi iter_mut)
+                            if let Some(batch) = batch_to_forward {
+                                self.tx_batch
+                                    .send(batch)
+                                    .await
+                                    .expect("Failed to deliver batch");
+                            }
+                            if let Some(id) = batch_id_to_remove {
+                                pending_batches.remove(&id);
+                            }
+                        }
+                        ReqResEvent::RequestFailed { request_id, to_peer, error } => {
+                            log::warn!("[QuorumWaiter] Request {} to {} failed: {}", request_id, to_peer, error);
+                            // TODO: Implement retry logic or handle failure
+                        }
+                        _ => {}
+                    }
+                }
+                
+                else => {
+                    log::warn!("QuorumWaiter channels closed");
                     break;
                 }
             }

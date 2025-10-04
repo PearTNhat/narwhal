@@ -387,7 +387,21 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .unwrap()
                 .parse::<WorkerId>()
                 .context("The worker id must be a positive integer")?;
-            Worker::spawn(keypair.name, id, committee, parameters, store);
+            
+            // TODO: Tạo peer_mapping từ committee (map PublicKey -> PeerId)
+            // Hiện tại dùng HashMap rỗng, cần implement peer discovery sau
+            let peer_mapping = std::collections::HashMap::new();
+            
+            Worker::spawn(
+                keypair.name, 
+                id, 
+                committee, 
+                parameters, 
+                store,
+                Some(tx_req_res_command.clone()),
+                None, // tx_req_res_event_to_quorum sẽ được tạo bên trong Worker
+                peer_mapping,
+            );
         }
         _ => unreachable!(),
     }

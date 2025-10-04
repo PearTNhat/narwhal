@@ -17,6 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
+use libp2p::PeerId;
+use p2p::{ReqResCommand, ReqResEvent};
+use std::collections::HashMap;
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -50,6 +53,12 @@ pub struct Worker {
     parameters: Parameters,
     /// The persistent storage.
     store: Store,
+    /// Channel to send P2P request-response commands.
+    tx_req_res: Option<Sender<ReqResCommand>>,
+    /// Channel to send P2P request-response events to QuorumWaiter (for ACKs).
+    tx_req_res_event_to_quorum: Option<Sender<ReqResEvent>>,
+    /// Mapping from PublicKey to PeerId for P2P communication.
+    peer_mapping: HashMap<PublicKey, PeerId>,
 }
 
 impl Worker {
@@ -59,6 +68,9 @@ impl Worker {
         committee: Committee,
         parameters: Parameters,
         store: Store,
+        tx_req_res: Option<Sender<ReqResCommand>>,
+        tx_req_res_event_to_quorum: Option<Sender<ReqResEvent>>,
+        peer_mapping: HashMap<PublicKey, PeerId>,
     ) {
         // Define a worker instance.
         let worker = Self {
@@ -67,6 +79,9 @@ impl Worker {
             committee,
             parameters,
             store,
+            tx_req_res,
+            tx_req_res_event_to_quorum,
+            peer_mapping,
         };
 
         // Spawn all worker tasks.
@@ -167,6 +182,18 @@ impl Worker {
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
         // (in a reliable manner) the batches to all other workers that share the same `id` as us. Finally, it
         // gathers the 'cancel handlers' of the messages and send them to the `QuorumWaiter`.
+        
+        // Tạo P2P request-response channel cho QuorumWaiter (để nhận ACK)
+        let (tx_req_res_event_for_quorum, rx_req_res_event_for_quorum) = channel(CHANNEL_CAPACITY);
+        
+        // Forward P2P ACK events từ worker's rx đến QuorumWaiter's tx
+        if let Some(tx_to_quorum) = self.tx_req_res_event_to_quorum.clone() {
+            tokio::spawn(async move {
+                // TODO: Nhận P2P events từ main's rx_req_res_event và forward vào tx_to_quorum
+                // Điều này cần một channel khác từ main.rs
+            });
+        }
+        
         BatchMaker::spawn(
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
@@ -178,6 +205,11 @@ impl Worker {
                 .iter()
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
+            /* peer_mapping */ self.peer_mapping.clone(),
+            /* tx_req_res */ self.tx_req_res.clone().unwrap_or_else(|| {
+                let (tx, _rx) = channel(1);
+                tx
+            }),
         );
 
          // 3. Khởi chạy 'bộ phận chờ xác nhận'.
@@ -189,6 +221,7 @@ impl Worker {
             /* stake */ self.committee.stake(&self.name),
             /* rx_message */ rx_quorum_waiter,
             /* tx_batch */ tx_processor,
+            /* rx_req_res_event */ rx_req_res_event_for_quorum,
         );
 
          // 4. Khởi chạy 'bộ phận lưu kho và dán nhãn'.
@@ -214,7 +247,7 @@ impl Worker {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
-        // 1. Mở 'cổng giao tiếp' để nhận tin nhắn từ các worker ngang hàng.
+        // 1. Mở 'cổng giao tiếp' để nhận tin nhắn từ các worker ngang hàng (TCP - legacy).
         // Receive incoming messages from other workers.
         let mut address = self
             .committee
@@ -228,10 +261,15 @@ impl Worker {
             // Tùy vào loại tin nhắn, handler sẽ chuyển đến bộ phận phù hợp.
             /* handler */
             WorkerReceiverHandler {
-                tx_helper,    // Nếu là yêu cầu xin batch -> Helper.
+                tx_helper: tx_helper.clone(),    // Nếu là yêu cầu xin batch -> Helper.
                 tx_processor, // Nếu là batch hoàn chỉnh -> Processor.
             },
         );
+        
+        // 1b. NOTE: P2P batch reception sẽ được xử lý trong event_loop.rs
+        // và forward vào tx_processor_p2p qua channel riêng biệt
+        // Chúng ta sẽ cần thêm một channel từ P2P event loop đến Worker
+        
         // 2. Khởi chạy 'bộ phận hỗ trợ'.
         // Chuyên trả lời các yêu cầu xin batch từ các worker khác.
         // The `Helper` is dedicated to reply to batch requests from other workers.
@@ -288,7 +326,7 @@ impl MessageHandler for TxReceiverHandler {
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
-    tx_processor: Sender<SerializedBatchMessage>,
+    tx_processor: Sender<SerializedBatchMessage>,t
 }
 
 #[async_trait]
