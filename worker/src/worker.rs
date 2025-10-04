@@ -326,7 +326,7 @@ impl MessageHandler for TxReceiverHandler {
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
-    tx_processor: Sender<SerializedBatchMessage>,t
+    tx_processor: Sender<SerializedBatchMessage>,
 }
 
 #[async_trait]
