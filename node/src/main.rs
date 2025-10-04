@@ -17,6 +17,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use prost::Message;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+use tokio::time::{sleep, Duration};
 
 // Import P2P modules
 use libp2p::{gossipsub, PeerId};
@@ -24,6 +25,7 @@ use p2p::{
     event_loop,
     functions::{create_derived_keypair},
     types::{get_primary_topic, get_worker_topic, P2pMessage, PrimaryMessage1, WorkerMessage1},
+    ReqResCommand, ReqResEvent,
 };
 
 // Thêm module để import các struct được tạo bởi prost
@@ -112,17 +114,19 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
-  
+    let role: &str;
     // 2. XÁC ĐỊNH VAI TRÒ VÀ TẠO P2P KEYPAIR DUY NHẤT
     // Logic này được chuyển lên trước để quyết định component_id
-    let (p2p_keypair, role) = match matches.subcommand() {
+    let (p2p_keypair, _) = match matches.subcommand() {
         ("primary", _) => {
+            role = "Primary";
             info!("Running as a PRIMARY");
             // Sử dụng một ID đặc biệt cho Primary để đảm bảo nó khác với mọi Worker
             let key = create_derived_keypair(&keypair.name, u32::MAX);
             (key, "Primary")
         }
         ("worker", Some(sub_matches)) => {
+            role = "Worker";
             let id = sub_matches.value_of("id").unwrap().parse::<WorkerId>()?;
             info!("Running as a WORKER with id {}", id);
             // Sử dụng chính WorkerId để tạo keypair duy nhất
@@ -143,7 +147,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     // Lắng nghe trên một port duy nhất (logic tìm port trống của bạn rất tốt)
     let mut p2p_port = 9000; // Port khởi đầu
-    for _ in 0..10 {
+    for _ in 0..15 {
         let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{}/quic-v1", p2p_port).parse()?;
         match swarm.listen_on(listen_addr) {
             Ok(_) => {
@@ -174,30 +178,119 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let (tx_to_primary, mut rx_for_primary) = channel(CHANNEL_CAPACITY);
     // Kênh để P2P event loop gửi message đã xử lý vào logic Worker
     let (tx_to_worker, mut rx_for_worker) = channel(CHANNEL_CAPACITY);
+    
+    // Kênh cho Request-Response
+    let (tx_req_res_command, rx_req_res_command) = channel(CHANNEL_CAPACITY);
+    let (tx_req_res_event, mut rx_req_res_event) = channel(CHANNEL_CAPACITY);
+    
     // Chạy P2P event loop trong một task riêng
-   // Chạy P2P event loop trong một task riêng
     tokio::spawn(async move {
-        event_loop::run_p2p_event_loop(swarm, rx_from_core, tx_to_primary, tx_to_worker).await;
+        event_loop::run_p2p_event_loop(
+            swarm, 
+            rx_from_core, 
+            tx_to_primary, 
+            tx_to_worker,
+            rx_req_res_command,
+            tx_req_res_event,
+        ).await;
     });
 
     // --- KẾT THÚC KHỞI TẠO P2P ---
-    // --- 4. DEMO GỬI VÀ NHẬN MESSAGE CÓ CẤU TRÚC ---
+    
+    // --- 4A. DEMO GOSSIPSUB (Hello messages) ---
     let tx_p2p_clone = tx_to_p2p.clone();
     let key_name_clone = keypair.name.clone();
     tokio::spawn(async move {
         use tokio::time::{sleep, Duration};
         sleep(Duration::from_secs(5)).await; // Đợi mạng ổn định
+        let mut counter: u64 = 0;
+        loop {
+           counter += 1;
+           
+           // Chỉ gửi Hello message qua gossipsub
+           let hello_msg = format!(
+               "Hello from {} {}: [Seq: {}]",
+               role, key_name_clone, counter
+           );
+
+           let (topic, p2p_message) = if role == "Primary" {
+               (get_primary_topic(), P2pMessage::Primary(PrimaryMessage1::Hello(hello_msg)))
+           } else {
+               (get_worker_topic(), P2pMessage::Worker(WorkerMessage1::Hello(hello_msg)))
+           };
+           
+        //    log::info!("📤 [GOSSIPSUB] Sending Hello message #{}", counter);
+        //    if tx_p2p_clone.send((topic, p2p_message)).await.is_err() {
+        //        log::warn!("Core logic channel closed, stopping demo sender.");
+        //        break;
+        //    }
+           
+           sleep(Duration::from_secs(10)).await;
+        }
+    });
+    
+    // --- 4B. DEMO REQUEST-RESPONSE (Với ACK tracking) ---
+    let tx_req_res_cmd_clone = tx_req_res_command.clone();
+    let key_name_clone2 = keypair.name.clone();
+    let local_peer_id_clone = local_peer_id;
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(8)).await; // Đợi mạng ổn định và peer discovery
+        
+        // Lấy danh sách peers đã discovered (sẽ được populate bởi mDNS)
+        // Trong production, bạn sẽ track peers qua mDNS events
+        let mut request_counter: u64 = 0;
         
         loop {
-            let hello_msg = format!("Hello from Primary {}", key_name_clone);
-            let p2p_message = P2pMessage::Primary(PrimaryMessage1::Hello(hello_msg));
+            request_counter += 1;
+            let discovered_peer_id = local_peer_id_clone; // Giả sử chúng ta có một peer khác để gửi request
+            // Trong thực tế, bạn sẽ maintain một list peers từ mDNS/Kad
+            log::info!("📤 [REQ-RES DEMO] Would send Request #{} if peers available", request_counter);
+            log::info!("    💡 To demo: Run another node, it will auto-discover via mDNS");
+            log::info!("    💡 Requests will be sent automatically to discovered peers");
             
-            // Gửi message lên topic của Primary
-            if tx_p2p_clone.send((get_primary_topic(), p2p_message)).await.is_err() {
-                log::warn!("Core logic channel closed, stopping demo sender.");
-                break;
+          //  TODO: Khi có peer, gửi request như sau:
+            let data = format!("Request data from {}", key_name_clone2);
+            if let Err(e) = tx_req_res_cmd_clone.send(ReqResCommand::SendRequest {
+                request_id: request_counter,
+                target_peer: discovered_peer_id,
+                data: data.into_bytes(),
+            }).await {
+                log::warn!("Failed to send ReqResCommand: {}", e);
             }
-            sleep(Duration::from_secs(10)).await;
+            
+            sleep(Duration::from_secs(15)).await;
+        }
+    });
+    
+    // --- 4C. Task lắng nghe Request-Response Events (ACKs) ---
+    tokio::spawn(async move {
+        use std::collections::HashMap;
+        let mut pending_requests: HashMap<u64, tokio::time::Instant> = HashMap::new();
+        
+        info!("👂 [REQ-RES] Event listener started");
+        
+        while let Some(event) = rx_req_res_event.recv().await {
+            match event {
+                ReqResEvent::ResponseReceived { request_id, from_peer, success, message } => {
+                    if let Some(sent_time) = pending_requests.remove(&request_id) {
+                        let latency = sent_time.elapsed();
+                        info!("✅ [REQ-RES] ACK received for Request #{}", request_id);
+                        info!("    ├─ From: {}", from_peer);
+                        info!("    ├─ Success: {}", success);
+                        info!("    ├─ Message: '{}'", message);
+                        info!("    └─ Latency: {:?}", latency);
+                    }
+                }
+                ReqResEvent::RequestFailed { request_id, to_peer, error } => {
+                    pending_requests.remove(&request_id);
+                    log::warn!("❌ [REQ-RES] Request #{} failed to {}: {}", request_id, to_peer, error);
+                }
+                ReqResEvent::RequestReceived { request_id, from_peer, data } => {
+                    info!("📨 [REQ-RES] Received Request #{} from {}", request_id, from_peer);
+                    info!("    └─ Data: {} bytes", data.len());
+                    // ACK đã được tự động gửi trong handler
+                }
+            }
         }
     });
 
@@ -208,6 +301,14 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             match message {
                 PrimaryMessage1::Hello(msg) => {
                     info!("🎉 [PRIMARY LOGIC] Received Hello: '{}'", msg);
+                }
+                PrimaryMessage1::Request { request_id, data } => {
+                    info!("📨 [PRIMARY LOGIC] Received Request #{}: {}", request_id, data);
+                    // Logic xử lý request ở đây (response đã tự động gửi trong handler)
+                }
+                PrimaryMessage1::Response { request_id, data } => {
+                    info!("✅ [PRIMARY LOGIC] Received Response #{}: {}", request_id, data);
+                    // Xử lý response ở đây
                 }
                 // Thêm các case xử lý cho các loại message khác của Primary
                 // PrimaryMessage::Header(header_bytes) => { ... }
@@ -222,6 +323,14 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
              match message {
                 WorkerMessage1::Hello(msg) => {
                      info!("🎉 [WORKER LOGIC] Received Hello: '{}'", msg);
+                }
+                WorkerMessage1::Request { request_id, data } => {
+                    info!("📨 [WORKER LOGIC] Received Request #{}: {}", request_id, data);
+                    // Logic xử lý request ở đây (response đã tự động gửi trong handler)
+                }
+                WorkerMessage1::Response { request_id, data } => {
+                    info!("✅ [WORKER LOGIC] Received Response #{}: {}", request_id, data);
+                    // Xử lý response ở đây
                 }
                 // Thêm các case xử lý cho các loại message khác của Worker
              }
@@ -262,11 +371,11 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             Consensus::spawn(
                 committee,
                 parameters.gc_depth,
-                /* rx_primary */ rx_new_certificates,
-                /* tx_primary */ tx_feedback,
+                store.clone(),
+                rx_new_certificates,
+                tx_feedback,
                 tx_output,
             );
-
             // Giao kết quả cuối cùng cho người phục vụ
             analyze(rx_output, node_id, store).await;
         }

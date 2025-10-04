@@ -4,9 +4,11 @@ use libp2p::{
     identify::{Behaviour as Identify, Event as IdentifyEvent},
     kad::{store::MemoryStore, Behaviour as Kademlia, Event as KademliaEvent},
     mdns::{tokio::Behaviour as Mdns, Event as MdnsEvent},
+    request_response,
     swarm::NetworkBehaviour,
 };
 use serde::{Deserialize, Serialize};
+use crate::req_res::GenericCodec;
 
 // Cấu trúc tin nhắn chung để broadcast
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +46,7 @@ pub struct MyBehaviour {
     pub mdns: Mdns,
     pub gossipsub: Gossipsub,
     pub identify: Identify,
+    pub req_res: request_response::Behaviour<GenericCodec>,
 }
 
 // Enum để gom tất cả các sự kiện từ các hành vi khác nhau.
@@ -53,6 +56,7 @@ pub enum MyBehaviourEvent {
     Mdns(MdnsEvent),
     Gossipsub(gossipsub::Event),
     Identify(IdentifyEvent),
+    ReqRes(request_response::Event<crate::req_res::GenericRequest, crate::req_res::GenericResponse>),
 }
 
 impl From<KademliaEvent> for MyBehaviourEvent {
@@ -79,6 +83,12 @@ impl From<IdentifyEvent> for MyBehaviourEvent {
     }
 }
 
+impl From<request_response::Event<crate::req_res::GenericRequest, crate::req_res::GenericResponse>> for MyBehaviourEvent {
+    fn from(event: request_response::Event<crate::req_res::GenericRequest, crate::req_res::GenericResponse>) -> Self {
+        MyBehaviourEvent::ReqRes(event)
+    }
+}
+
 
 // Enum cấp cao nhất để đóng gói tất cả các loại message có thể gửi qua mạng.
 // Giúp việc deserialize ở phía nhận trở nên an toàn và rõ ràng.
@@ -95,6 +105,9 @@ pub enum PrimaryMessage1 {
     // Header(Vec<u8>), // Chứa header đã được serialize
     // Vote(Vec<u8>),   // Chứa vote đã được serialize
     Hello(String), // Giữ lại để demo
+    // Request-Response pattern
+    Request { request_id: u64, data: String },
+    Response { request_id: u64, data: String },
 }
 
 // Enum cho các message liên quan đến giao tiếp giữa các Worker.
@@ -104,6 +117,9 @@ pub enum WorkerMessage1 {
     // Ví dụ:
     // RequestBatch(Vec<u8>),
     Hello(String), // Giữ lại để demo
+    // Request-Response pattern
+    Request { request_id: u64, data: String },
+    Response { request_id: u64, data: String },
 }
 
 // -- Topics --
@@ -117,3 +133,4 @@ pub fn get_primary_topic() -> gossipsub::IdentTopic {
 pub fn get_worker_topic() -> gossipsub::IdentTopic {
     gossipsub::IdentTopic::new("narwhal-worker-sync")
 }
+

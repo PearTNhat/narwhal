@@ -10,6 +10,7 @@ bytes = "1"
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3.3"
 log = "0.4.11"
+async-trait = "0.1.50"
 
 dashmap = "5.5"
 arc-swap = "1.6"
@@ -19,7 +20,8 @@ hex = "0.4"
 toml = "0.8"
 
 libp2p = { version = "0.53.2", features = [
-    "tokio", "gossipsub", "mdns", "kad", "quic", "macros", "secp256k1",  "identify"
+    "tokio", "gossipsub", "mdns", "kad", "quic", "macros", "secp256k1",  "identify",  "request-response" 
 ]}
+
 network = { path = "../network" }
 crypto = { path = "../crypto" }

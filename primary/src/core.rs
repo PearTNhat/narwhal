@@ -223,7 +223,6 @@ impl Core {
                 .append(vote, &self.committee, &self.current_header)?
         {
             debug!("Assembled {:?}", certificate);
-
             // Broadcast the certificate.
             let addresses = self
                 .committee

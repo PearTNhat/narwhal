@@ -26,7 +26,7 @@ toml = "0.8"
 libp2p = { version = "0.53.2", features = [
     "tokio", "gossipsub", "mdns", "kad", "quic", "macros", "secp256k1",  "identify"
 ]}
-
+libp2p-request-response = "0.24"
 
 config = { path = "../config" }
 store = { path = "../store" }

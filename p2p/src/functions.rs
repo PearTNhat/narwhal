@@ -82,12 +82,16 @@ pub async fn create_p2p_swarm(
         "/ipfs/id/1.0.0".to_string(),
         local_key.public(),
     ));
+    
+    // Thêm Request-Response behaviour
+    let req_res_behaviour = crate::req_res::create_request_response_behaviour();
 
     let behaviour = MyBehaviour {
         kad: kad_behaviour,
         mdns: mdns_behaviour,
         gossipsub: gossipsub_behaviour,
         identify: identify_behaviour,
+        req_res: req_res_behaviour,
     };
 
     let swarm = SwarmBuilder::with_existing_identity(local_key)

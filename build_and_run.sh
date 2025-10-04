@@ -7,7 +7,7 @@
 set -e
 
 # Cấu hình Benchmark
-NODES=5
+NODES=3
 RATE=60000
 TX_SIZE=600
 DURATION=30
